@@ -18,19 +18,23 @@ type deviceResult struct {
 	Name, IP, MAC, Risk string
 	Vendor              string
 	ProbableType        string
+	IdentifiedBy        string // which source decided ProbableType, shown on the card
+	Model               string // the device's own name for itself (UPnP or web page title)
 	Hostname            string
 	Ports               []string // formatted text for the dashboard
 	PortNumbers         []string // just the numbers, to compare between scans
 	Isolated            bool
 	SentPackets         int64
-	IPv4BlockActive     bool   // true only if the iptables DROP rule really exists right now
-	IPv6BlockActive     bool   // same for ip6tables (extra defence beyond the forged RA)
-	Trusted             bool   // set by hand — suppresses risk-change alerts
-	BlockedPackets      int64  // the real iptables counter, not the ARP packets we sent
-	ProbableOS          string //
-	OutsideSubnet       bool   // came from a REDES_EXTRAS range: visible, but not containable
-	Agent               string // which agent reported it; empty means this machine
-	AgentURL            string // where to send isolate/reconnect orders for it
+	IPv4BlockActive     bool     // true only if the iptables DROP rule really exists right now
+	IPv6BlockActive     bool     // same for ip6tables (extra defence beyond the forged RA)
+	Trusted             bool     // set by hand — suppresses risk-change alerts
+	BlockedPackets      int64    // the real iptables counter, not the ARP packets we sent
+	ProbableOS          string   //
+	OutsideSubnet       bool     // came from a REDES_EXTRAS range: visible, but not containable
+	IPv6                []string // IPv6 addresses seen for this MAC, link-local first
+	IPv6Only            bool     // answered only over IPv6: visible, but ARP cannot reach it
+	Agent               string   // which agent reported it; empty means this machine
+	AgentURL            string   // where to send isolate/reconnect orders for it
 }
 
 // allResults merges what this machine scanned with what the agents
@@ -54,6 +58,10 @@ const maxHosts = 24
 
 func scanNetwork(network *networkInfo) []deviceResult {
 	candidates := hostsToScan(network)
+	// the IPv6 sweep is one multicast ping, so it runs alongside the IPv4
+	// one instead of adding its two seconds to the cycle
+	v6ch := make(chan map[string][]string, 1)
+	go func() { v6ch <- discoverIPv6Neighbours(network.Interface) }()
 	hosts, ttls := findActiveHosts(candidates)
 	arpTable := readARPTable(network.Interface)
 	checkGatewaySpoofing(network, arpTable)
@@ -104,21 +112,9 @@ func scanNetwork(network *networkInfo) []deviceResult {
 			r.ProbableOS = classifyOSByTTL(ttls[host])
 			if mac, ok := arpTable[host]; ok {
 				r.MAC = mac.String()
-				r.Vendor, r.ProbableType = lookupByMAC(r.MAC)
 				r.Trusted = isTrusted(r.MAC)
 			}
 			r.Hostname = resolveHostname(host)
-			if t := refineTypeByHostname(r.Hostname); t != "" {
-				r.ProbableType = t
-			}
-			// mDNS/SSDP are the strongest signal (the device announcing
-			// itself), so they take priority over the MAC OUI and hostname
-			if t := typeByMDNS(host); t != "" {
-				r.ProbableType = t
-			}
-			if t := typeBySSDP(host); t != "" {
-				r.ProbableType = t
-			}
 
 			worstRisk := ""
 			if r.Trusted {
@@ -156,18 +152,7 @@ func scanNetwork(network *networkInfo) []deviceResult {
 			}
 			r.Risk = worstRisk
 
-			// Last-resort identification, only when OUI, hostname, mDNS and
-			// SSDP did not classify the type. Open ports (a functional
-			// signal) take priority over the randomized-MAC guess, which
-			// only says it is a personal device with MAC privacy on,
-			// without saying which.
-			if r.ProbableType == "" {
-				if t := inferTypeByPorts(r.PortNumbers); t != "" {
-					r.ProbableType = t
-				} else if isRandomizedMAC(r.MAC) {
-					r.ProbableType = "📱 Provável celular/notebook (privacidade de MAC ligada)"
-				}
-			}
+			identifyDevice(&r)
 
 			isolationsMu.Lock()
 			state, isolated := isolations[host]
@@ -188,6 +173,39 @@ func scanNetwork(network *networkInfo) []deviceResult {
 		}(host)
 	}
 	wg.Wait()
+	return mergeIPv6(network, results, arpTable, <-v6ch)
+}
+
+// mergeIPv6 attaches the IPv6 addresses to the devices already found by
+// IPv4, matching by MAC, and adds as IPv6-only the MACs that answered
+// the multicast ping but are nowhere in the ARP table.
+func mergeIPv6(network *networkInfo, results []deviceResult, arpTable map[string]net.HardwareAddr, v6 map[string][]string) []deviceResult {
+	if len(v6) == 0 {
+		return results
+	}
+	for i := range results {
+		results[i].IPv6 = v6[strings.ToLower(results[i].MAC)]
+	}
+
+	inARP := map[string]bool{}
+	for _, mac := range arpTable {
+		inARP[mac.String()] = true
+	}
+	for mac, addrs := range v6 {
+		hw, _ := net.ParseMAC(mac)
+		// the router and this machine are left out here as they are from
+		// the IPv4 list; so is anything ARP already knows
+		if inARP[mac] || sameMAC(hw, network.GatewayMAC) || sameMAC(hw, network.MAC) {
+			continue
+		}
+		r := deviceResult{Name: addrs[0], IP: addrs[0], MAC: mac, IPv6: addrs, IPv6Only: true, Risk: "baixo"}
+		r.Trusted = isTrusted(r.MAC)
+		// no port scan: the containment cannot reach it, and scanning
+		// every address of every such device would lengthen the cycle
+		// for information nobody could act on
+		identifyDevice(&r)
+		results = append(results, r)
+	}
 	return results
 }
 

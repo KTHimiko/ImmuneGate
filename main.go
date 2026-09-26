@@ -65,6 +65,11 @@ func main() {
 		}
 	}
 
+	if path, n := loadOUIRegistry(); n > 0 {
+		fmt.Printf("Base de fabricantes: %d prefixos de MAC (%s)\n", n, path)
+	} else {
+		fmt.Println("Base de fabricantes do sistema não encontrada — usando só a tabela embutida (instale hwdata ou ieee-data pra identificar mais aparelhos)")
+	}
 	loadHistory()
 	loadTrusted()
 	loadKnownDevices()
@@ -109,6 +114,8 @@ func main() {
 	http.HandleFunc("/isolar", isolateHandler(network))
 	http.HandleFunc("/reconectar", reconnectHandler(network))
 	http.HandleFunc("/confiavel", trustHandler(network))
+	http.HandleFunc("/exportar/dispositivos.csv", exportDevicesHandler)
+	http.HandleFunc("/exportar/historico.csv", exportHistoryHandler)
 
 	port := "8090"
 	if v := os.Getenv("PORTA"); v != "" {

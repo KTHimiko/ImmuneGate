@@ -117,6 +117,7 @@ h2 { font-size:.95rem; margin:0 0 .75rem; letter-spacing:-.01em; }
 .dev-ip { font-weight:600; font-size:.95rem; }
 .dev-risk { font-size:.75rem; color:var(--ink-2); }
 .meta { font-size:.8rem; color:var(--ink-2); margin-top:.15rem; }
+.meta.src { font-size:.72rem; color:var(--ink-3); margin-top:0; }
 .mac { font-size:.75rem; color:var(--ink-3); font-variant-numeric:tabular-nums; }
 .prio { font-size:.7rem; padding:.05rem .45rem; border-radius:9px; border:1px solid var(--border); }
 .prio.p2 { background:var(--risk-alto); color:var(--on-solid); border-color:transparent; }
@@ -208,7 +209,11 @@ func summaryTiles(results []deviceResult) string {
 // once here so the script only has to lowercase the query. The same text
 // goes on the card and on the map node, so both filter identically.
 func searchText(r deviceResult) string {
-	fields := []string{r.IP, r.Hostname, r.MAC, r.Vendor, r.ProbableType, r.ProbableOS, riskLabel[r.Risk]}
+	fields := []string{r.IP, r.Hostname, r.Model, r.MAC, r.Vendor, r.ProbableType, r.ProbableOS, riskLabel[r.Risk]}
+	fields = append(fields, r.IPv6...)
+	if r.IPv6Only {
+		fields = append(fields, "ipv6")
+	}
 	if r.Agent != "" {
 		fields = append(fields, "agente "+r.Agent)
 	}
@@ -232,6 +237,11 @@ func deviceCard(r deviceResult, ctx riskContext) string {
 			prio, html.EscapeString(prioReason), prio.label())
 	}
 
+	v6badge := ""
+	if r.IPv6Only {
+		v6badge = `<span class="prio">só IPv6</span>`
+	}
+
 	agent := ""
 	if r.Agent != "" {
 		agent = fmt.Sprintf(`<span class="badge-agent">agente %s</span>`, html.EscapeString(r.Agent))
@@ -243,6 +253,9 @@ func deviceCard(r deviceResult, ctx riskContext) string {
 	}
 
 	var meta []string
+	if r.Model != "" {
+		meta = append(meta, "<b>"+html.EscapeString(r.Model)+"</b>")
+	}
 	if r.ProbableType != "" {
 		meta = append(meta, r.ProbableType)
 	}
@@ -250,7 +263,7 @@ func deviceCard(r deviceResult, ctx riskContext) string {
 		meta = append(meta, r.ProbableOS)
 	}
 	if r.Vendor != "" && r.Vendor != "Desconhecido" {
-		meta = append(meta, r.Vendor)
+		meta = append(meta, html.EscapeString(r.Vendor))
 	}
 	// health only for what this machine probed: a device behind an agent
 	// was pinged by that agent, not by us
@@ -266,6 +279,15 @@ func deviceCard(r deviceResult, ctx riskContext) string {
 	metaLine := `<div class="meta"><i>Tipo não identificado</i></div>`
 	if len(meta) > 0 {
 		metaLine = fmt.Sprintf(`<div class="meta">%s</div>`, strings.Join(meta, " · "))
+	}
+	if len(r.IPv6) > 0 && !r.IPv6Only {
+		metaLine += fmt.Sprintf(`<div class="meta mac">IPv6: %s</div>`, html.EscapeString(strings.Join(r.IPv6, " · ")))
+	}
+	// saying where the guess came from is what lets the user judge it: a
+	// type read from the device's own UPnP description deserves more trust
+	// than one inferred from an open port
+	if r.IdentifiedBy != "" {
+		metaLine += fmt.Sprintf(`<div class="meta src">identificado por %s</div>`, html.EscapeString(r.IdentifiedBy))
 	}
 
 	mac := r.MAC
@@ -299,6 +321,8 @@ func deviceCard(r deviceResult, ctx riskContext) string {
 			class, r.BlockedPackets, state, v6)
 		controls = fmt.Sprintf(
 			`<form method="POST" action="/reconectar"><input type="hidden" name="ip" value="%s"><button class="btn btn-ok" type="submit">Reconectar</button></form>`, r.IP)
+	case r.IPv6Only:
+		notice = `<div class="note">🌐 Respondeu só por IPv6 — não aparece na tabela ARP. Dá pra ver que existe e de quem é, mas o isolamento é feito por ARP e não o alcança. Se ele tiver IPv4 e só estiver bloqueando ping, deve aparecer normalmente nas próximas varreduras.</div>`
 	case r.OutsideSubnet:
 		notice = `<div class="note">🌐 Está em outra sub-rede e sem agente. Dá pra ver que existe e quais portas expõe, mas não dá pra identificar o fabricante nem isolar — ARP não atravessa roteador. Conter este dispositivo exigiria um agente dentro da sub-rede dele.</div>`
 	case r.MAC == "":
@@ -332,7 +356,7 @@ func deviceCard(r deviceResult, ctx riskContext) string {
 	<div class="%s" data-ip="%s" data-busca="%s">
 		<div class="dev-top">
 			<span class="dot" style="background:var(--risk-%s)"></span>
-			<span class="dev-ip">%s</span>%s%s%s
+			<span class="dev-ip">%s</span>%s%s%s%s
 			<span class="mac">%s</span>
 			<span class="dev-risk">%s</span>
 		</div>
@@ -340,7 +364,7 @@ func deviceCard(r deviceResult, ctx riskContext) string {
 		%s
 		%s
 		%s
-	</div>`, classes, html.EscapeString(r.IP), searchText(r), slug, r.IP, name, prioBadge, agent, mac, riskLabel[r.Risk], metaLine, ports, notice, controls)
+	</div>`, classes, html.EscapeString(r.IP), searchText(r), slug, html.EscapeString(r.IP), v6badge, name, prioBadge, agent, mac, riskLabel[r.Risk], metaLine, ports, notice, controls)
 }
 
 func mapLegend() string {
@@ -394,6 +418,7 @@ func pageHTML(network *networkInfo, results []deviceResult, lastUpdate time.Time
     <div class="actions">
       <a class="btn btn-primary" href="/atualizar">Nova varredura</a>
       <a class="btn" href="/historico">Histórico</a>
+      <a class="btn" href="/exportar/dispositivos.csv" title="Planilha com todos os dispositivos (abre no Excel/LibreOffice)">Exportar CSV</a>
     </div>
   </header>
 
@@ -606,6 +631,7 @@ func historyHTML() string {
   <header>
     <div><h1>🕒 Histórico de eventos</h1><p class="sub">Do mais recente para o mais antigo.</p></div>
     <a class="btn" href="/">Voltar ao painel</a>
+    <a class="btn" href="/exportar/historico.csv" title="Histórico completo em planilha">Exportar CSV</a>
   </header>
   <div class="actions" style="margin-bottom:.8rem">
     <button class="btn" data-sev="">Tudo</button>

@@ -31,6 +31,9 @@ func shortLabel(r deviceResult) string {
 		}
 		return html.EscapeString(h)
 	}
+	if strings.Contains(r.IP, ":") {
+		return html.EscapeString(shortIPv6(r.IP))
+	}
 	parts := strings.Split(r.IP, ".")
 	if len(parts) == 4 {
 		return "." + parts[3]
@@ -45,6 +48,9 @@ func nodeTooltip(r deviceResult) string {
 	parts := []string{r.IP}
 	if r.Hostname != "" {
 		parts = append(parts, r.Hostname)
+	}
+	if r.Model != "" {
+		parts = append(parts, r.Model)
 	}
 	if r.ProbableType != "" {
 		parts = append(parts, r.ProbableType)

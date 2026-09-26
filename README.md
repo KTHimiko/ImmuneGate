@@ -18,10 +18,17 @@ Trabalho para a Feira FatecExpo em Redes de Computadores, Fatec Osasco.
 ## O que ele faz
 
 **Descoberta e identificação.** Varre a sub-rede, e para cada aparelho
-tenta dizer o que ele é: fabricante pelo prefixo OUI do MAC, nome de host
-por DNS reverso, anúncios mDNS e SSDP que o próprio dispositivo emite,
-sistema operacional provável pelo TTL, e tipo inferido pelas portas
-abertas. MACs aleatórios de privacidade são reconhecidos como tais.
+tenta dizer o que ele é, a partir de várias fontes, da mais forte para
+a mais fraca: a descrição UPnP que o próprio aparelho publica
+(fabricante e modelo), respostas mDNS (perguntadas a cada dois minutos,
+com o nome que o usuário deu ao aparelho) e SSDP, o título da página de
+administração, o nome de host (DNS reverso ou o nome pedido no DHCP), o
+cliente DHCP (`android-dhcp`, `MSFT 5.0`, `udhcp`), o fabricante pelo
+prefixo do MAC na base completa do IEEE, e por fim as portas abertas. O
+painel mostra qual fonte decidiu. MACs aleatórios de privacidade são
+reconhecidos como tais. Um ping para todos os nós IPv6 (`ff02::1`)
+mostra os endereços IPv6 de cada aparelho e revela os que só respondem
+por IPv6.
 
 **Classificação de risco.** Dezessete portas TCP associadas a serviços
 sensíveis, mais verificação do certificado TLS na 443 — um certificado
@@ -56,6 +63,7 @@ equivalente em outros sistemas.
 - `iptables` e `ip6tables`
 - `iproute2` (`ip`), `iputils` (`ping`)
 - `NetworkManager` (`nmcli`), opcional: sem ele as checagens de Wi-Fi ficam desligadas
+- `hwdata` ou `ieee-data`, opcional: a base completa de fabricantes (uns 40 mil prefixos de MAC). Sem ela, só a tabela embutida, de umas setenta entradas
 
 ## Compilar e executar
 
@@ -95,6 +103,7 @@ Tudo por variável de ambiente, e todas têm padrão utilizável.
 
 | Variável | Padrão | Para que serve |
 |---|---|---|
+| `INTERFACE` | rota padrão preferida | Qual rede monitorar quando há mais de uma ativa (ex.: `wlan0`, `enp0s31f6`) |
 | `PORTA` | `8090` | Porta do painel web |
 | `PAINEL_NA_REDE` | — | `1` abre o painel para a rede toda, **sem senha**. Ignorada em modo agente |
 | `INTERVALO_SEGUNDOS` | `20` | Intervalo entre varreduras |
@@ -106,6 +115,9 @@ Tudo por variável de ambiente, e todas têm padrão utilizável.
 | `AGENTES` | — | Agentes que a central agrega: `nome=http://ip:8095,...` |
 | `NOME_AGENTE` | hostname | Como este agente se identifica |
 | `PORTA_API` | `8095` | Porta da API do agente |
+
+O painel exporta o inventário e o histórico completo em CSV (separado
+por ponto e vírgula, para abrir direto no Excel em português).
 
 Três arquivos são gravados no diretório de trabalho: `historico.jsonl`
 (eventos), `conhecidos.json` (inventário de MACs já vistos) e
@@ -177,11 +189,15 @@ Um único pacote, separado por responsabilidade:
 | `main.go` | Entrada, portas verificadas, variáveis de ambiente, rotas |
 | `network.go` | Detecção de interface, gateway e tabela ARP |
 | `ports.go` | Varredura de portas, certificado TLS, TTL e latência |
-| `identification.go` | Tabela OUI, DNS reverso, tipo por porta e MAC aleatório |
-| `mdns_ssdp.go` | Escuta mDNS e sondagem SSDP |
+| `identification.go` | Tabela OUI embutida, DNS reverso, ordem das fontes de identificação |
+| `oui.go` | Base de fabricantes do IEEE lida do sistema |
+| `ipv6.go` | Descoberta de vizinhos IPv6 |
+| `export.go` | Exportação em CSV |
+| `banner.go` | Página de administração do aparelho e descrição UPnP |
+| `mdns_ssdp.go` | Consulta e escuta mDNS, sondagem SSDP |
 | `isolation.go` | Contenção, verificação do bloqueio e captura do tráfego |
 | `spoofing.go` | ARP spoofing de terceiros e MAC duplicado |
-| `dhcp.go` | Servidor DHCP não autorizado |
+| `dhcp.go` | Servidor DHCP não autorizado e identificação pelos pedidos DHCP |
 | `wifi.go` | Criptografia do Wi-Fi e evil twin |
 | `upnp.go` | Exposição à internet pelo roteador |
 | `monitoring.go` | Laço contínuo e comparação entre ciclos |

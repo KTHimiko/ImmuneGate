@@ -6,6 +6,7 @@ import (
 	"net"
 	"os"
 	"os/exec"
+	"strconv"
 	"strings"
 )
 
@@ -65,6 +66,70 @@ func hostsToScan(network *networkInfo) []string {
 	return hosts
 }
 
+type defaultRoute struct {
+	gateway, iface string
+	metric         int
+}
+
+// parseDefaultRoutes reads `ip route show default`, one route per line:
+//
+//	default via 192.168.2.1 dev enp0s31f6 proto dhcp src 192.168.2.156 metric 100
+//	default via 10.174.52.6 dev wlan0 proto dhcp src 10.174.52.139 metric 600
+//
+// A laptop plugged in and on Wi-Fi at the same time has both. This used
+// to read the output as one flat list of words, so the last "via" and the
+// last "dev" won — the route with the highest metric, the one the system
+// does not use — and the program scanned the Wi-Fi while every device was
+// on the cable.
+func parseDefaultRoutes(output string) []defaultRoute {
+	var routes []defaultRoute
+	for _, line := range strings.Split(output, "\n") {
+		f := strings.Fields(line)
+		var r defaultRoute
+		for i := 0; i+1 < len(f); i++ {
+			switch f[i] {
+			case "via":
+				r.gateway = f[i+1]
+			case "dev":
+				r.iface = f[i+1]
+			case "metric":
+				r.metric, _ = strconv.Atoi(f[i+1])
+			}
+		}
+		// a default route with no gateway (a VPN's "dev tun0") has no
+		// router to scan around
+		if r.gateway != "" && r.iface != "" {
+			routes = append(routes, r)
+		}
+	}
+	return routes
+}
+
+// chooseRoute picks the route on the interface the user named (INTERFACE),
+// or else the one the system itself prefers: the lowest metric.
+func chooseRoute(routes []defaultRoute, wanted string) (defaultRoute, error) {
+	if len(routes) == 0 {
+		return defaultRoute{}, fmt.Errorf("nenhuma rota padrão com gateway")
+	}
+	if wanted != "" {
+		var names []string
+		for _, r := range routes {
+			if r.iface == wanted {
+				return r, nil
+			}
+			names = append(names, r.iface)
+		}
+		return defaultRoute{}, fmt.Errorf("INTERFACE=%s não tem rota padrão; as disponíveis são: %s", wanted, strings.Join(names, ", "))
+	}
+	best := routes[0]
+	for _, r := range routes[1:] {
+		if r.metric < best.metric {
+			best = r
+		}
+	}
+	return best, nil
+}
+
 // detectNetwork finds which interface holds the default route (the real
 // network the laptop is using, Wi-Fi or wired) and returns its IP, mask,
 // MAC and gateway.
@@ -73,18 +138,20 @@ func detectNetwork() (*networkInfo, error) {
 	if err != nil {
 		return nil, fmt.Errorf("não foi possível ler a rota padrão: %w", err)
 	}
-	fields := strings.Fields(string(output))
-	var gatewayStr, iface string
-	for i, field := range fields {
-		if field == "via" && i+1 < len(fields) {
-			gatewayStr = fields[i+1]
-		}
-		if field == "dev" && i+1 < len(fields) {
-			iface = fields[i+1]
-		}
+	routes := parseDefaultRoutes(string(output))
+	route, err := chooseRoute(routes, strings.TrimSpace(os.Getenv("INTERFACE")))
+	if err != nil {
+		return nil, fmt.Errorf("%w (saída do ip route: %q)", err, output)
 	}
-	if iface == "" || gatewayStr == "" {
-		return nil, fmt.Errorf("não encontrei a interface/gateway padrão (saída: %q)", output)
+	gatewayStr, iface := route.gateway, route.iface
+	if len(routes) > 1 && os.Getenv("INTERFACE") == "" {
+		var others []string
+		for _, r := range routes {
+			if r.iface != iface {
+				others = append(others, r.iface)
+			}
+		}
+		fmt.Printf("Mais de uma rede ativa: usando %s (a rota preferida do sistema). Pra usar outra: INTERFACE=%s\n", iface, others[0])
 	}
 
 	ni, err := net.InterfaceByName(iface)

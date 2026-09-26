@@ -93,6 +93,8 @@ func evaluateAdmission(r deviceResult) verdict {
 		return verdict{true, "sob a política do agente " + r.Agent}
 	case r.OutsideSubnet:
 		return verdict{true, "fora da sub-rede — sem alcance para aplicar política"}
+	case r.IPv6Only:
+		return verdict{true, "visto só por IPv6 — sem alcance por ARP para aplicar política"}
 	case r.MAC == "":
 		return verdict{true, "sem MAC resolvido — indeterminado"}
 	case !alreadyKnown(r.MAC):

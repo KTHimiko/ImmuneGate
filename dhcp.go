@@ -3,6 +3,7 @@ package main
 import (
 	"fmt"
 	"net"
+	"strings"
 	"sync"
 	"time"
 
@@ -59,8 +60,15 @@ func startRogueDHCPDetection(iface string) {
 				continue
 			}
 			dhcp, ok := dhcpLayer.(*layers.DHCPv4)
-			if !ok || dhcp.Operation != layers.DHCPOpReply {
-				continue // only server replies (OFFER/ACK) matter, not client requests
+			if !ok {
+				continue
+			}
+			if dhcp.Operation == layers.DHCPOpRequest {
+				// client requests do not matter for rogue servers, but
+				// they are how a device introduces itself — see
+				// recordDHCPClient
+				recordDHCPClient(dhcp)
+				continue
 			}
 
 			var msgType layers.DHCPMsgType
@@ -117,4 +125,79 @@ func startRogueDHCPDetection(iface string) {
 			}
 		}
 	}()
+}
+
+// ---------- passive identification from DHCP requests ----------
+
+// A device asking for an address says two useful things about itself in
+// the broadcast it sends: the name it wants registered (option 12, e.g.
+// "Galaxy-S21" or "ESP_3A2B1C") and a vendor class naming its DHCP
+// client (option 60, e.g. "android-dhcp-14" or "MSFT 5.0"). Both arrive
+// even from phones with a randomized MAC — the case where the vendor
+// table has nothing to say. They are only seen when a device joins or
+// reboots, since lease renewals go unicast to the router; what is learnt
+// is kept for as long as the program runs.
+type dhcpClient struct {
+	Hostname    string
+	VendorClass string
+}
+
+var dhcpClientsMu sync.RWMutex
+var dhcpClients = map[string]dhcpClient{}
+
+// maxDHCPClients caps the table: requests are broadcast by anyone, and a
+// flood of forged ones with random MACs should not grow it without bound.
+const maxDHCPClients = 4096
+
+func recordDHCPClient(d *layers.DHCPv4) {
+	if len(d.ClientHWAddr) != 6 {
+		return
+	}
+	var c dhcpClient
+	for _, opt := range d.Options {
+		switch opt.Type {
+		case layers.DHCPOptHostname:
+			c.Hostname = cleanLabel(string(opt.Data), 64)
+		case layers.DHCPOptClassID:
+			c.VendorClass = cleanLabel(string(opt.Data), 64)
+		}
+	}
+	if c.Hostname == "" && c.VendorClass == "" {
+		return
+	}
+	mac := d.ClientHWAddr.String()
+	dhcpClientsMu.Lock()
+	defer dhcpClientsMu.Unlock()
+	if _, known := dhcpClients[mac]; !known && len(dhcpClients) >= maxDHCPClients {
+		return
+	}
+	dhcpClients[mac] = c
+}
+
+func dhcpClientFor(mac string) dhcpClient {
+	if mac == "" {
+		return dhcpClient{}
+	}
+	dhcpClientsMu.RLock()
+	defer dhcpClientsMu.RUnlock()
+	return dhcpClients[strings.ToLower(mac)]
+}
+
+// typeByDHCPVendorClass reads the client's own name. These are the
+// strings the stock DHCP clients send; a device that customises them
+// simply falls through to the other signals.
+func typeByDHCPVendorClass(vc string) string {
+	v := strings.ToLower(vc)
+	switch {
+	case v == "":
+		return ""
+	case strings.HasPrefix(v, "android-dhcp"):
+		return "📱 Celular/tablet (Android)"
+	case strings.HasPrefix(v, "msft"):
+		return "💻 Computador (Windows)"
+	case strings.HasPrefix(v, "udhcp"):
+		// BusyBox's client: the default in embedded Linux firmware
+		return "💡 Dispositivo embarcado (Linux/BusyBox)"
+	}
+	return ""
 }

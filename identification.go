@@ -102,10 +102,12 @@ var ouiTable = map[string]vendorInfo{
 	"08:00:27": {"Oracle VirtualBox", "🖥️ Máquina virtual"},
 }
 
-// lookupByMAC looks the OUI (first 3 bytes) of the MAC up in the table
-// and returns the vendor plus a guess at the device type. When the MAC is
-// not in the table — the common case, since the list is small — it
-// returns "Desconhecido" instead of failing or inventing a classification.
+// lookupByMAC looks the OUI (first 3 bytes) of the MAC up and returns the
+// vendor plus a guess at the device type. The hand-written table wins,
+// because its entries carry a curated type; the IEEE registry loaded from
+// disk supplies the vendor for everything else, with a type only when the
+// vendor makes one kind of product. When neither knows the prefix it
+// returns "Desconhecido" instead of inventing a classification.
 func lookupByMAC(mac string) (vendor, deviceType string) {
 	if len(mac) < 8 {
 		return "", ""
@@ -113,6 +115,9 @@ func lookupByMAC(mac string) (vendor, deviceType string) {
 	oui := strings.ToUpper(mac[:8])
 	if info, ok := ouiTable[oui]; ok {
 		return info.vendor, info.deviceType
+	}
+	if org, ok := ouiRegistry[strings.ReplaceAll(oui, ":", "")]; ok {
+		return cleanLabel(org, 40), vendorTypeHint(org)
 	}
 	return "Desconhecido", ""
 }
@@ -142,21 +147,41 @@ func refineTypeByHostname(hostname string) string {
 	switch {
 	case h == "":
 		return ""
-	case strings.Contains(h, "iphone") || strings.Contains(h, "android") || strings.Contains(h, "galaxy") || strings.Contains(h, "redmi"):
+	case strings.Contains(h, "iphone") || strings.Contains(h, "ipad") || strings.Contains(h, "android") || strings.Contains(h, "galaxy") || strings.Contains(h, "redmi"):
 		return "📱 Celular/tablet"
-	case strings.Contains(h, "desktop") || strings.Contains(h, "notebook") || strings.Contains(h, "laptop") || strings.Contains(h, "pc-"):
+	case strings.Contains(h, "desktop") || strings.Contains(h, "notebook") || strings.Contains(h, "laptop") || strings.Contains(h, "pc-") || strings.Contains(h, "macbook") || strings.Contains(h, "imac"):
 		return "💻 Computador (PC/notebook)"
+	case strings.Contains(h, "playstation") || strings.Contains(h, "ps4") || strings.Contains(h, "ps5") || strings.Contains(h, "xbox") || strings.Contains(h, "nintendo"):
+		return typeConsole
+	// ESP_XXXXXX is the default name of any ESP8266/ESP32 firmware, and
+	// the rest are the open firmwares people flash onto smart plugs
+	case strings.HasPrefix(h, "esp_") || strings.HasPrefix(h, "esp-") || strings.Contains(h, "espressif") || strings.Contains(h, "tasmota") || strings.Contains(h, "shelly") || strings.Contains(h, "sonoff"):
+		return typeIoT
+	case strings.Contains(h, "raspberrypi"):
+		return "🍓 Raspberry Pi / placa de projeto"
 	case strings.Contains(h, "printer") || strings.Contains(h, "impressora"):
 		return "🖨️ Impressora"
 	case strings.Contains(h, "smarttv") || strings.Contains(h, "smart-tv") || strings.Contains(h, "bravia") || strings.Contains(h, "roku"):
 		return "📺 Smart TV"
 	case strings.Contains(h, "echo") || strings.Contains(h, "alexa") || strings.Contains(h, "google-home") || strings.Contains(h, "chromecast"):
 		return "🔊 Assistente virtual / streaming"
-	case strings.Contains(h, "cam") || strings.Contains(h, "camera"):
+	case hasCameraWord(h):
 		return "🎥 Câmera IP"
 	default:
 		return ""
 	}
+}
+
+// hasCameraWord looks for "cam" as a word or a word ending, not as any
+// substring: "ipcam-sala" and "webcam" are cameras, "MacBook-de-Camila"
+// is not — and was, before this check.
+func hasCameraWord(h string) bool {
+	for _, w := range nonWord.Split(h, -1) {
+		if strings.HasPrefix(w, "camera") || strings.HasSuffix(w, "cam") {
+			return true
+		}
+	}
+	return false
 }
 
 // isRandomizedMAC reports whether the MAC has the "locally administered"
@@ -206,5 +231,78 @@ func inferTypeByPorts(ports []string) string {
 		return "🖥️ Servidor/dispositivo com acesso SSH"
 	default:
 		return ""
+	}
+}
+
+// identifyDevice decides the device type from every source available and
+// records which one decided, so the dashboard can say why it believes
+// what it shows. The order is from what the device says about itself to
+// what is merely inferred about it:
+//
+//  1. UPnP description — the device names its own manufacturer and model
+//  2. mDNS service type — the device announces what service it offers
+//  3. SSDP reply text
+//  4. its web admin page — the product name in the title or Server header
+//  5. its hostname — chosen by the user or the firmware, usually telling
+//  6. its DHCP client — says the operating system family, not the device
+//  7. the MAC vendor — says who made the network card, not the device
+//  8. its open ports — what it does, not what it is
+//  9. a randomized MAC — only "some personal device"
+//
+// It has to run after the port scan, since the web page is only fetched
+// from devices that have a web port open.
+func identifyDevice(r *deviceResult) {
+	var ouiType string
+	if r.MAC != "" {
+		r.Vendor, ouiType = lookupByMAC(r.MAC)
+	}
+
+	dhcp := dhcpClientFor(r.MAC)
+	mdns := mdnsInfoFor(r.IP)
+	if r.Hostname == "" {
+		r.Hostname = dhcp.Hostname
+	}
+	if r.Hostname == "" {
+		r.Hostname = mdns.Hostname
+	}
+
+	upnp := upnpDescriptionFor(r.IP)
+	var banner webBanner
+	if !r.Trusted { // trusted devices skip the port scan, so there is nothing to fetch from
+		banner = httpBannerFor(r.IP, r.PortNumbers)
+	}
+
+	// the model line: the device's own name for itself, when it gave one
+	switch {
+	case upnp.label() != "":
+		r.Model = upnp.label()
+	case mdns.Instance != "":
+		r.Model = mdns.Instance
+	case banner.Title != "":
+		r.Model = banner.Title
+	}
+	if (r.Vendor == "" || r.Vendor == "Desconhecido") && upnp.Manufacturer != "" {
+		r.Vendor = upnp.Manufacturer
+	}
+
+	candidates := []struct{ deviceType, source string }{
+		{upnp.deviceTypeGuess(), "descrição UPnP"},
+		{typeByMDNS(r.IP), "anúncio mDNS"},
+		{typeBySSDP(r.IP), "resposta SSDP"},
+		{classifyByText(banner.Text), "página web do aparelho"},
+		{refineTypeByHostname(r.Hostname), "nome na rede"},
+		{typeByDHCPVendorClass(dhcp.VendorClass), "cliente DHCP (" + dhcp.VendorClass + ")"},
+		{ouiType, "fabricante do MAC"},
+		{inferTypeByPorts(r.PortNumbers), "portas abertas"},
+	}
+	for _, c := range candidates {
+		if c.deviceType != "" {
+			r.ProbableType, r.IdentifiedBy = c.deviceType, c.source
+			return
+		}
+	}
+	if isRandomizedMAC(r.MAC) {
+		r.ProbableType = "📱 Provável celular/notebook (privacidade de MAC ligada)"
+		r.IdentifiedBy = "MAC aleatório"
 	}
 }
